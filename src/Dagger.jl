@@ -57,6 +57,7 @@ include("array/sort.jl")
 include("ui/graph.jl")
 include("ui/gantt-common.jl")
 include("ui/gantt-text.jl")
+include("utils/caching.jl")
 
 # Logging
 include("lib/logging-events.jl")
