@@ -9,8 +9,11 @@ import Random: randperm
 import Base: @invokelatest
 
 import ..Dagger
-import ..Dagger: Context, Processor, Thunk, WeakThunk, ThunkFuture, ThunkFailedException, Chunk, WeakChunk, OSProc, AnyScope
+import ..Dagger: Context, Processor, Thunk, WeakThunk, ThunkFuture, ThunkFailedException, Chunk, WeakChunk, OSProc, AnyScope, LockedObject
 import ..Dagger: order, dependents, noffspring, istask, inputs, unwrap_weak_checked, affinity, tochunk, timespan_start, timespan_finish, procs, move, chunktype, processor, default_enabled, get_processors, get_parent, execute!, rmprocs!, addprocs!, thunk_processor, constrain, cputhreadtime
+import DataStructures: PriorityQueue, enqueue!, dequeue_pair!, peek
+
+import ..Dagger
 
 const OneToMany = Dict{Thunk, Set{Thunk}}
 
@@ -183,16 +186,20 @@ instances/subtypes of a contained type. Alternatively, a function can be
 supplied, and the function will be called with a processor as the sole
 argument and should return a `Bool` result to indicate whether or not to use
 the given processor. `nothing` enables all default processors.
-- `time_util::Dict{Type,Any}=Dict{Type,Any}()`: Indicates the maximum expected
-time utilization for this thunk. Each keypair maps a processor type to the
-utilization, where the value can be a real (approximately the number of
-nanoseconds taken), or `MaxUtilization()` (utilizes all processors of this
-type). By default, the scheduler assumes that this thunk only uses one
-processor.
-- `alloc_util::Dict{Type,UInt64}=Dict{Type,UInt64}()`: Indicates the maximum
-expected memory utilization for this thunk. Each keypair maps a processor type
-to the utilization, where the value is an integer representing approximately
-the maximum number of bytes allocated at any one time.
+- `time_util::Dict{Type,Any}`: Indicates the maximum expected time utilization
+for this thunk. Each keypair maps a processor type to the utilization, where
+the value can be a real (approximately the number of nanoseconds taken), or
+`MaxUtilization()` (utilizes all processors of this type). By default, the
+scheduler assumes that this thunk only uses one processor.
+- `alloc_util::Dict{Type,UInt64}`: Indicates the maximum expected memory
+utilization for this thunk. Each keypair maps a processor type to the
+utilization, where the value is an integer representing approximately the
+maximum number of bytes allocated at any one time.
+- `occupancy::Dict{Type,Real}`: Indicates the maximum expected processor
+occupancy for this thunk. Each keypair maps a processor type to the
+utilization, where the value can be a real between 0 and 1 (the occupancy
+ratio, where 1 is full occupancy). By default, the scheduler assumes that this
+thunk has full occupancy.
 - `allow_errors::Bool=true`: Allow this thunk to error without affecting
 non-dependent thunks.
 - `checkpoint=nothing`: If not `nothing`, uses the provided function to save
@@ -215,14 +222,12 @@ Base.@kwdef struct ThunkOptions
     proclist = nothing
     time_util::Union{Dict{Type,Any},Nothing} = nothing
     alloc_util::Union{Dict{Type,UInt64},Nothing} = nothing
+    occupancy::Union{Dict{Type,Real},Nothing} = nothing
     allow_errors::Union{Bool,Nothing} = nothing
     checkpoint = nothing
     restore = nothing
     storage::Union{Chunk,Nothing} = nothing
 end
-
-# Eager scheduling
-include("eager.jl")
 
 """
     Base.merge(sopts::SchedulerOptions, topts::ThunkOptions) -> ThunkOptions
@@ -237,6 +242,7 @@ function Base.merge(sopts::SchedulerOptions, topts::ThunkOptions)
                  proclist,
                  topts.time_util,
                  topts.alloc_util,
+                 topts.occupancy,
                  allow_errors,
                  topts.checkpoint,
                  topts.restore,
@@ -269,6 +275,7 @@ function populate_defaults(opts::ThunkOptions, Tf, Targs)
         maybe_default(:proclist),
         maybe_default(:time_util),
         maybe_default(:alloc_util),
+        maybe_default(:occupancy),
         maybe_default(:allow_errors),
         maybe_default(:checkpoint),
         maybe_default(:restore),
@@ -278,6 +285,9 @@ end
 
 function cleanup(ctx)
 end
+
+# Eager scheduling
+include("eager.jl")
 
 const WORKER_MONITOR_LOCK = Threads.ReentrantLock()
 const WORKER_MONITOR_TASKS = Dict{Int,Task}()
@@ -597,7 +607,7 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         populate_processor_cache_list!(state, procs)
 
         # Schedule tasks
-        to_fire = Dict{Tuple{OSProc,<:Processor},Vector{Tuple{Thunk,<:Any,<:Any}}}()
+        to_fire = Dict{Tuple{OSProc,<:Processor},Vector{Tuple{Thunk,<:Any,UInt64,UInt32}}}()
         failed_scheduling = Thunk[]
 
         # Select a new task and get its options
@@ -683,11 +693,15 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         for proc in local_procs
             gproc = get_parent(proc)
             if can_use_proc(task, gproc, proc, opts, scope)
-                has_cap, est_time_util, est_alloc_util = has_capacity(state, proc, gproc.pid, opts.time_util, opts.alloc_util, sig)
+                has_cap, est_time_util, est_alloc_util, est_occupancy =
+                    has_capacity(state, proc, gproc.pid, opts.time_util, opts.alloc_util, opts.occupancy, sig)
                 if has_cap
                     # Schedule task onto proc
                     # FIXME: est_time_util = est_time_util isa MaxUtilization ? cap : est_time_util
-                    push!(get!(()->Vector{Tuple{Thunk,<:Any,<:Any}}(), to_fire, (gproc, proc)), (task, est_time_util, est_alloc_util))
+                    proc_tasks = get!(to_fire, (gproc, proc)) do
+                        Vector{Tuple{Thunk,<:Any,UInt64,UInt32}}()
+                    end
+                    push!(proc_tasks, (task, est_time_util, est_alloc_util, est_occupancy))
                     state.worker_time_pressure[gproc.pid][proc] += est_time_util
                     @goto pop_task
                 end
@@ -707,7 +721,8 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         procs_found = false
         # N.B. if we only have one processor, we need to select it now
         if can_use_proc(task, entry.gproc, entry.proc, opts, scope)
-            has_cap, est_time_util, est_alloc_util = has_capacity(state, entry.proc, entry.gproc.pid, opts.time_util, opts.alloc_util, sig)
+            has_cap, est_time_util, est_alloc_util, est_occupancy =
+                has_capacity(state, entry.proc, entry.gproc.pid, opts.time_util, opts.alloc_util, opts.occupancy, sig)
             if has_cap
                 selected_entry = entry
             else
@@ -731,7 +746,8 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
             end
 
             if can_use_proc(task, entry.gproc, entry.proc, opts, scope)
-                has_cap, est_time_util, est_alloc_util = has_capacity(state, entry.proc, entry.gproc.pid, opts.time_util, opts.alloc_util, sig)
+                has_cap, est_time_util, est_alloc_util, est_occupancy =
+                    has_capacity(state, entry.proc, entry.gproc.pid, opts.time_util, opts.alloc_util, opts.occupancy, sig)
                 if has_cap
                     # Select this processor
                     selected_entry = entry
@@ -750,7 +766,10 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         # Schedule task onto proc
         gproc, proc = entry.gproc, entry.proc
         est_time_util = est_time_util isa MaxUtilization ? cap : est_time_util
-        push!(get!(()->Vector{Tuple{Thunk,<:Any,<:Any}}(), to_fire, (gproc, proc)), (task, est_time_util, est_alloc_util))
+        proc_tasks = get!(to_fire, (gproc, proc)) do
+            Vector{Tuple{Thunk,<:Any,UInt64,UInt32}}()
+        end
+        push!(proc_tasks, (task, est_time_util, est_alloc_util, est_occupancy))
 
         # Proceed to next entry to spread work
         state.procs_cache_list[] = state.procs_cache_list[].next
@@ -868,13 +887,13 @@ function evict_chunks!(log_sink, chunks::Set{Chunk})
     nothing
 end
 
-fire_task!(ctx, thunk::Thunk, p, state; time_util=10^9, alloc_util=10^6) =
-    fire_task!(ctx, (thunk, time_util, alloc_util), p, state)
-fire_task!(ctx, (thunk, time_util, alloc_util)::Tuple{Thunk,<:Any}, p, state) =
-    fire_tasks!(ctx, [(thunk, time_util, alloc_util)], p, state)
+fire_task!(ctx, thunk::Thunk, p, state; time_util=10^9, alloc_util=10^6, occupancy=typemax(UInt32)) =
+    fire_task!(ctx, (thunk, time_util, alloc_util, occupancy), p, state)
+fire_task!(ctx, (thunk, time_util, alloc_util, occupancy)::Tuple{Thunk,<:Any}, p, state) =
+    fire_tasks!(ctx, [(thunk, time_util, alloc_util, occupancy)], p, state)
 function fire_tasks!(ctx, thunks::Vector{<:Tuple}, (gproc, proc), state)
     to_send = []
-    for (thunk, time_util, alloc_util) in thunks
+    for (thunk, time_util, alloc_util, occupancy) in thunks
         push!(state.running, thunk)
         state.running_on[thunk] = gproc
         if thunk.cache && thunk.cache_ref !== nothing
@@ -922,7 +941,7 @@ function fire_tasks!(ctx, thunks::Vector{<:Tuple}, (gproc, proc), state)
         sch_handle = SchedulerHandle(ThunkID(thunk.id, nothing), state.worker_chans[gproc.pid]...)
 
         # TODO: De-dup common fields (log_sink, uid, etc.)
-        push!(to_send, Any[thunk.id, time_util, alloc_util, chunktype(thunk.f), data, thunk.get_result,
+        push!(to_send, Any[thunk.id, time_util, alloc_util, occupancy, chunktype(thunk.f), data, thunk.get_result,
                            thunk.persist, thunk.cache, thunk.meta, options,
                            propagated, ids,
                            (log_sink=ctx.log_sink, profile=ctx.profile),
@@ -949,14 +968,78 @@ function fire_tasks!(ctx, thunks::Vector{<:Tuple}, (gproc, proc), state)
     end
 end
 
-"""
-    do_tasks(to_proc, chan, tasks)
+struct ProcessorRuntimeState
+    queue::LockedObject{PriorityQueue{Vector{Any}, UInt32, Base.Order.ForwardOrdering}}
+    runner::Task
+end
 
-Executes a batch of tasks on `to_proc`.
+const PROCESSOR_TASK_STATE = LockedObject(Dict{Processor,ProcessorRuntimeState}())
+
+function start_processor_runner!(to_proc::Processor, queue_locked, return_queue::RemoteChannel)
+    # FIXME: Refactor so that we minimize boilerplate
+    return Threads.@spawn begin
+        proc_occupancy = UInt32(0)
+        tasks = Dict{Int,Task}()
+
+        while isopen(return_queue)
+            # Fetch a new task to execute
+            task_occupancy = lock(queue_locked) do queue
+                if length(queue) == 0
+                    return nothing
+                end
+                _, occupancy = peek(queue)
+                if UInt64(occupancy) + UInt64(proc_occupancy) <= typemax(UInt32)
+                    return dequeue_pair!(queue)
+                end
+                return nothing
+            end
+            if task_occupancy === nothing
+                # FIXME: Efficiently wait for more tasks
+                sleep(0.1)
+                continue
+            end
+            task, occupancy = task_occupancy
+
+            # Execute the task and return its result
+            thunk_id = task[1]
+            t = @async try
+                result = do_task(to_proc, task)
+                put!(return_queue, (myid(), to_proc, thunk_id, result))
+            catch err
+                bt = catch_backtrace()
+                @error "Task execution error for $thunk_id" exception=(err, bt)
+                put!(return_queue, (myid(), to_proc, thunk_id,
+                                    (CapturedException(err, bt), nothing)))
+            finally
+                delete!(tasks, thunk_id)
+                proc_occupancy -= occupancy
+            end
+            errormonitor(t)
+            tasks[thunk_id] = t
+            proc_occupancy += occupancy
+        end
+    end
+end
+
 """
-function do_tasks(to_proc, chan, tasks)
+    do_tasks(to_proc, return_queue, tasks)
+
+Executes a batch of tasks on `to_proc`, returning their results through
+`return_queue`.
+"""
+function do_tasks(to_proc, return_queue, tasks)
+    state = lock(PROCESSOR_TASK_STATE) do states
+        get!(states, to_proc) do
+            queue = PriorityQueue{Vector{Any}, UInt32}()
+            queue_locked = LockedObject(queue)
+            runner = start_processor_runner!(to_proc, queue_locked, return_queue)
+            errormonitor(runner)
+            return ProcessorRuntimeState(queue_locked, runner)
+        end
+    end
     for task in tasks
         thunk_id = task[1]
+        occupancy = task[4]
         should_launch = lock(TASK_SYNC) do
             # Already running; don't try to re-launch
             if !(thunk_id in TASKS_RUNNING)
@@ -967,20 +1050,19 @@ function do_tasks(to_proc, chan, tasks)
             end
         end
         should_launch || continue
-        @async begin
-            try
-                result = do_task(to_proc, task)
-                put!(chan, (myid(), to_proc, thunk_id, result))
-            catch ex
-                bt = catch_backtrace()
-                put!(chan, (myid(), to_proc, thunk_id, (CapturedException(ex, bt), nothing)))
-            end
+        lock(state.queue) do queue
+            enqueue!(queue, task, occupancy)
         end
     end
 end
-"Executes a single task on `to_proc`."
-function do_task(to_proc, comm)
-    thunk_id, est_time_util, est_alloc_util, Tf, data, send_result, persist, cache, meta, options, propagated, ids, ctx_vars, sch_handle, uid = comm
+
+"""
+    do_task(to_proc, task_desc) -> Any
+
+Executes a single task specified by `task_desc` on `to_proc`.
+"""
+function do_task(to_proc, task_desc)
+    thunk_id, est_time_util, est_alloc_util, est_occupancy, Tf, data, send_result, persist, cache, meta, options, propagated, ids, ctx_vars, sch_handle, uid = task_desc
     ctx = Context(Processor[]; log_sink=ctx_vars.log_sink, profile=ctx_vars.profile)
 
     from_proc = OSProc()
@@ -1014,7 +1096,6 @@ function do_task(to_proc, comm)
             "[$(myid()), $thunk_id] $f($Tdata) $msg: $est_alloc_util | $real_alloc_util/$storage_cap"
         end
     end
-
     lock(TASK_SYNC) do
         while true
             # Get current time utilization for the selected processor
@@ -1190,7 +1271,7 @@ function do_task(to_proc, comm)
         gc_allocd=(isa(result_meta, Chunk) ? result_meta.handle.size : 0),
         transfer_rate=(transfer_size[] > 0 && transfer_time[] > 0) ? round(UInt64, transfer_size[] / (transfer_time[] / 10^9)) : nothing,
     )
-    (result_meta, metadata)
+    return (result_meta, metadata)
 end
 
 end # module Sch

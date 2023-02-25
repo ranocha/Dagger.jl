@@ -18,7 +18,7 @@ function init_eager()
     ctx = eager_context()
     @async try
         sopts = SchedulerOptions(;allow_errors=true)
-        topts = ThunkOptions(;single=1)
+        topts = ThunkOptions(;single=1, occupancy=Dict(Dagger.ThreadProc=>0))
         atexit() do
             EAGER_FORCE_KILL[] = true
             close(EAGER_THUNK_CHAN)
