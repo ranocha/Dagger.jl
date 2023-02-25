@@ -607,7 +607,7 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         populate_processor_cache_list!(state, procs)
 
         # Schedule tasks
-        to_fire = Dict{Tuple{OSProc,<:Processor},Vector{Tuple{Thunk,<:Any,UInt64,UInt32}}}()
+        to_fire = Dict{Tuple{OSProc,<:Processor},Vector{Tuple{Thunk,<:Any,<:Any,UInt64,UInt32}}}()
         failed_scheduling = Thunk[]
 
         # Select a new task and get its options
@@ -699,9 +699,9 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
                     # Schedule task onto proc
                     # FIXME: est_time_util = est_time_util isa MaxUtilization ? cap : est_time_util
                     proc_tasks = get!(to_fire, (gproc, proc)) do
-                        Vector{Tuple{Thunk,<:Any,UInt64,UInt32}}()
+                        Vector{Tuple{Thunk,<:Any,<:Any,UInt64,UInt32}}()
                     end
-                    push!(proc_tasks, (task, est_time_util, est_alloc_util, est_occupancy))
+                    push!(proc_tasks, (task, scope, est_time_util, est_alloc_util, est_occupancy))
                     state.worker_time_pressure[gproc.pid][proc] += est_time_util
                     @goto pop_task
                 end
@@ -767,9 +767,9 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         gproc, proc = entry.gproc, entry.proc
         est_time_util = est_time_util isa MaxUtilization ? cap : est_time_util
         proc_tasks = get!(to_fire, (gproc, proc)) do
-            Vector{Tuple{Thunk,<:Any,UInt64,UInt32}}()
+            Vector{Tuple{Thunk,<:Any,<:Any,UInt64,UInt32}}()
         end
-        push!(proc_tasks, (task, est_time_util, est_alloc_util, est_occupancy))
+        push!(proc_tasks, (task, scope, est_time_util, est_alloc_util, est_occupancy))
 
         # Proceed to next entry to spread work
         state.procs_cache_list[] = state.procs_cache_list[].next
@@ -887,13 +887,13 @@ function evict_chunks!(log_sink, chunks::Set{Chunk})
     nothing
 end
 
-fire_task!(ctx, thunk::Thunk, p, state; time_util=10^9, alloc_util=10^6, occupancy=typemax(UInt32)) =
-    fire_task!(ctx, (thunk, time_util, alloc_util, occupancy), p, state)
-fire_task!(ctx, (thunk, time_util, alloc_util, occupancy)::Tuple{Thunk,<:Any}, p, state) =
-    fire_tasks!(ctx, [(thunk, time_util, alloc_util, occupancy)], p, state)
+fire_task!(ctx, thunk::Thunk, p, state; scope=AnyScope(), time_util=10^9, alloc_util=10^6, occupancy=typemax(UInt32)) =
+    fire_task!(ctx, (thunk, scope, time_util, alloc_util, occupancy), p, state)
+fire_task!(ctx, (thunk, scope, time_util, alloc_util, occupancy)::Tuple{Thunk,<:Any}, p, state) =
+    fire_tasks!(ctx, [(thunk, scope, time_util, alloc_util, occupancy)], p, state)
 function fire_tasks!(ctx, thunks::Vector{<:Tuple}, (gproc, proc), state)
     to_send = []
-    for (thunk, time_util, alloc_util, occupancy) in thunks
+    for (thunk, scope, time_util, alloc_util, occupancy) in thunks
         push!(state.running, thunk)
         state.running_on[thunk] = gproc
         if thunk.cache && thunk.cache_ref !== nothing
@@ -941,8 +941,9 @@ function fire_tasks!(ctx, thunks::Vector{<:Tuple}, (gproc, proc), state)
         sch_handle = SchedulerHandle(ThunkID(thunk.id, nothing), state.worker_chans[gproc.pid]...)
 
         # TODO: De-dup common fields (log_sink, uid, etc.)
-        push!(to_send, Any[thunk.id, time_util, alloc_util, occupancy, chunktype(thunk.f), data, thunk.get_result,
-                           thunk.persist, thunk.cache, thunk.meta, options,
+        push!(to_send, Any[thunk.id, time_util, alloc_util, occupancy,
+                           scope, chunktype(thunk.f), data,
+                           thunk.get_result, thunk.persist, thunk.cache, thunk.meta, options,
                            propagated, ids,
                            (log_sink=ctx.log_sink, profile=ctx.profile),
                            sch_handle, state.uid])
@@ -968,22 +969,95 @@ function fire_tasks!(ctx, thunks::Vector{<:Tuple}, (gproc, proc), state)
     end
 end
 
-struct ProcessorRuntimeState
-    queue::LockedObject{PriorityQueue{Vector{Any}, UInt32, Base.Order.ForwardOrdering}}
-    runner::Task
+mutable struct Doorbell
+    waiter::Union{Task,Nothing}
+    @atomic sleeping::Int
+    Doorbell() = new(nothing, 0)
+end
+function Base.wait(db::Doorbell)
+    db.waiter = current_task()
+    while true
+        _, succ = @atomicreplace db.sleeping 0 => 1
+        if succ
+            # No messages, wait for someone to wake us
+            wait()
+        end
+        _, succ = @atomicreplace db.sleeping 2 => 0
+        if succ
+            # We had a notification
+            return
+        end
+    end
+end
+function Base.notify(db::Doorbell)
+    while true
+        if (@atomic db.sleeping) == 2
+            # Doorbell already rung
+            return
+        end
+
+        _, succ = @atomicreplace db.sleeping 0 => 2
+        if succ
+            # Task was definitely busy, we're done
+            return
+        end
+
+        _, succ = @atomicreplace db.sleeping 1 => 2
+        if succ
+            # Task was sleeping, wake it and wait for it to awaken
+            waiter = db.waiter
+            @assert waiter !== nothing
+            waiter::Task
+            schedule(waiter)
+            while true
+                sleep_value = @atomic db.sleeping
+                if sleep_value == 0 || sleep_value == 2
+                    return
+                end
+                #if waiter._state === Base.task_state_runnable && t.queue === nothing
+                #    schedule(waiter)
+                #else
+                    yield()
+                #end
+            end
+        end
+    end
 end
 
-const PROCESSOR_TASK_STATE = LockedObject(Dict{Processor,ProcessorRuntimeState}())
+struct ProcessorInternalState
+    ctx::Context
+    proc::Processor
+    queue::LockedObject{PriorityQueue{Vector{Any}, UInt32, Base.Order.ForwardOrdering}}
+    steal::Threads.Condition
+    reschedule::Doorbell
+end
+struct ProcessorState
+    state::ProcessorInternalState
+    runner::Task
+    stealer::Task
+end
 
-function start_processor_runner!(to_proc::Processor, queue_locked, return_queue::RemoteChannel)
+const PROCESSOR_TASK_STATE = LockedObject(Dict{Processor,ProcessorState}())
+
+function start_processor_runner!(istate::ProcessorInternalState, return_queue::RemoteChannel)
     # FIXME: Refactor so that we minimize boilerplate
-    return Threads.@spawn begin
+    return errormonitor(Threads.@spawn begin
+        ctx = istate.ctx
+        to_proc = istate.proc
         proc_occupancy = UInt32(0)
         tasks = Dict{Int,Task}()
 
         while isopen(return_queue)
+            # Wait for new tasks
+            timespan_start(ctx, :proc_run_wait, to_proc, nothing)
+            wait(istate.reschedule)
+            timespan_finish(ctx, :proc_run_wait, to_proc, nothing)
+
             # Fetch a new task to execute
-            task_occupancy = lock(queue_locked) do queue
+            timespan_start(ctx, :proc_run_fetch, to_proc, nothing)
+            task_and_occupancy = lock(istate.queue) do queue
+                # Only steal if there are multiple queued tasks, to prevent
+                # ping-pong of tasks between empty queues
                 if length(queue) == 0
                     return nothing
                 end
@@ -993,32 +1067,97 @@ function start_processor_runner!(to_proc::Processor, queue_locked, return_queue:
                 end
                 return nothing
             end
-            if task_occupancy === nothing
-                # FIXME: Efficiently wait for more tasks
-                sleep(0.1)
+            if task_and_occupancy === nothing
+                # Request to steal some tasks
+                lock(istate.steal) do
+                    notify(istate.steal)
+                end
+                timespan_finish(ctx, :proc_run_fetch, to_proc, nothing)
                 continue
             end
-            task, occupancy = task_occupancy
+            task, task_occupancy = task_and_occupancy
+            thunk_id = task[1]
+            timespan_finish(ctx, :proc_run_fetch, to_proc, (;thunk_id, proc_occupancy, task_occupancy))
 
             # Execute the task and return its result
-            thunk_id = task[1]
+            # N.B. This entire block to the end of the loop should be yield-less
             t = @async try
                 result = do_task(to_proc, task)
                 put!(return_queue, (myid(), to_proc, thunk_id, result))
             catch err
                 bt = catch_backtrace()
-                @error "Task execution error for $thunk_id" exception=(err, bt)
                 put!(return_queue, (myid(), to_proc, thunk_id,
                                     (CapturedException(err, bt), nothing)))
             finally
                 delete!(tasks, thunk_id)
-                proc_occupancy -= occupancy
+                proc_occupancy -= task_occupancy
+                notify(istate.reschedule)
             end
             errormonitor(t)
             tasks[thunk_id] = t
-            proc_occupancy += occupancy
+            proc_occupancy += task_occupancy
         end
-    end
+    end)
+end
+function start_task_stealer!(istate::ProcessorInternalState)
+    return errormonitor(Threads.@spawn begin
+        ctx = istate.ctx
+        to_proc = istate.proc
+        while true
+            timespan_start(ctx, :steal_wait, to_proc, nothing)
+            lock(istate.steal) do
+                wait(istate.steal)
+            end
+            timespan_finish(ctx, :steal_wait, to_proc, nothing)
+
+            timespan_start(ctx, :steal_local, to_proc, nothing)
+
+            # Try to steal from local queues randomly
+            # TODO: Prioritize stealing from busiest processors
+            states = collect(lock(values, PROCESSOR_TASK_STATE))
+            P = randperm(length(states))
+            success = false
+            for state in getindex.(Ref(states), P)
+                other_istate = state.state
+                if other_istate.proc === to_proc
+                    continue
+                end
+                result = lock(other_istate.queue) do queue
+                    if length(queue) <= 1
+                        return nothing
+                    end
+                    task, _ = peek(queue)
+                    scope = task[5]
+                    if !isa(constrain(scope, Dagger.ExactScope(to_proc)),
+                            Dagger.InvalidScope)
+                        # Compatible, steal this task
+                        # TODO: Steal from high-occupancy end
+                        return dequeue_pair!(queue)
+                    end
+                    return nothing
+                end
+                if result !== nothing
+                    success = true
+                    from_proc = other_istate.proc
+                    thunk_id = task[1]
+                    task, occupancy = result
+                    lock(istate.queue) do queue
+                        enqueue!(queue, task, occupancy)
+                    end
+                    notify(istate.reschedule)
+                    timespan_finish(ctx, :steal_local, to_proc, (;from_proc, thunk_id))
+                    # TODO: Keep stealing until we hit full occupancy?
+                    break
+                end
+            end
+            if success
+                continue
+            end
+            timespan_finish(ctx, :steal_local, to_proc, nothing)
+
+            # TODO: Try to steal from remote queues
+        end
+    end)
 end
 
 """
@@ -1028,32 +1167,43 @@ Executes a batch of tasks on `to_proc`, returning their results through
 `return_queue`.
 """
 function do_tasks(to_proc, return_queue, tasks)
+    # FIXME: This is terrible
+    ctx_vars = first(tasks)[15]
+    ctx = Context(Processor[]; log_sink=ctx_vars.log_sink, profile=ctx_vars.profile)
     state = lock(PROCESSOR_TASK_STATE) do states
         get!(states, to_proc) do
             queue = PriorityQueue{Vector{Any}, UInt32}()
             queue_locked = LockedObject(queue)
-            runner = start_processor_runner!(to_proc, queue_locked, return_queue)
-            errormonitor(runner)
-            return ProcessorRuntimeState(queue_locked, runner)
+            steal = Threads.Condition()
+            reschedule = Doorbell()
+            istate = ProcessorInternalState(ctx, to_proc, queue_locked, steal, reschedule)
+            runner = start_processor_runner!(istate, return_queue)
+            stealer = start_task_stealer!(istate)
+            reschedule.waiter = runner
+            return ProcessorState(istate, runner, stealer)
         end
     end
-    for task in tasks
-        thunk_id = task[1]
-        occupancy = task[4]
-        should_launch = lock(TASK_SYNC) do
-            # Already running; don't try to re-launch
-            if !(thunk_id in TASKS_RUNNING)
-                push!(TASKS_RUNNING, thunk_id)
-                true
-            else
-                false
+    istate = state.state
+    lock(istate.queue) do queue
+        for task in tasks
+            thunk_id = task[1]
+            occupancy = task[4]
+            timespan_start(ctx, :enqueue, (;to_proc, thunk_id), nothing)
+            should_launch = lock(TASK_SYNC) do
+                # Already running; don't try to re-launch
+                if !(thunk_id in TASKS_RUNNING)
+                    push!(TASKS_RUNNING, thunk_id)
+                    true
+                else
+                    false
+                end
             end
-        end
-        should_launch || continue
-        lock(state.queue) do queue
+            should_launch || continue
             enqueue!(queue, task, occupancy)
+            timespan_finish(ctx, :enqueue, (;to_proc, thunk_id), nothing)
         end
     end
+    notify(istate.reschedule)
 end
 
 """
@@ -1062,7 +1212,10 @@ end
 Executes a single task specified by `task_desc` on `to_proc`.
 """
 function do_task(to_proc, task_desc)
-    thunk_id, est_time_util, est_alloc_util, est_occupancy, Tf, data, send_result, persist, cache, meta, options, propagated, ids, ctx_vars, sch_handle, uid = task_desc
+    thunk_id, est_time_util, est_alloc_util, est_occupancy,
+        scope, Tf, data,
+        send_result, persist, cache, meta,
+        options, propagated, ids, ctx_vars, sch_handle, uid = task_desc
     ctx = Context(Processor[]; log_sink=ctx_vars.log_sink, profile=ctx_vars.profile)
 
     from_proc = OSProc()
