@@ -9,7 +9,7 @@ import Random: randperm
 import Base: @invokelatest
 
 import ..Dagger
-import ..Dagger: Context, Processor, Thunk, WeakThunk, ThunkFuture, ThunkFailedException, Chunk, WeakChunk, OSProc, DefaultScope
+import ..Dagger: Context, Processor, Thunk, WeakThunk, ThunkFuture, ThunkFailedException, Chunk, WeakChunk, OSProc, AnyScope, DefaultScope
 import ..Dagger: order, dependents, noffspring, istask, inputs, unwrap_weak_checked, affinity, tochunk, timespan_start, timespan_finish, procs, move, chunktype, processor, default_enabled, get_processors, get_parent, execute!, rmprocs!, addprocs!, thunk_processor, constrain, cputhreadtime
 
 const OneToMany = Dict{Thunk, Set{Thunk}}
@@ -634,7 +634,12 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         scope = if task.f isa Chunk
             task.f.scope
         else
-            DefaultScope()
+            if task.options.proclist !== nothing
+                # proclist overrides scope selection
+                AnyScope()
+            else
+                DefaultScope()
+            end
         end
         for input in task.inputs
             input = unwrap_weak_checked(input)
@@ -682,7 +687,8 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
 
         for proc in local_procs
             gproc = get_parent(proc)
-            if can_use_proc(task, gproc, proc, opts, scope)
+            can_use, scope = can_use_proc(task, gproc, proc, opts, scope)
+            if can_use
                 has_cap, est_time_util, est_alloc_util = has_capacity(state, proc, gproc.pid, opts.time_util, opts.alloc_util, sig)
                 if has_cap
                     # Schedule task onto proc
@@ -706,7 +712,8 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         cap, extra_util = nothing, nothing
         procs_found = false
         # N.B. if we only have one processor, we need to select it now
-        if can_use_proc(task, entry.gproc, entry.proc, opts, scope)
+        can_use, scope = can_use_proc(task, entry.gproc, entry.proc, opts, scope)
+        if can_use
             has_cap, est_time_util, est_alloc_util = has_capacity(state, entry.proc, entry.gproc.pid, opts.time_util, opts.alloc_util, sig)
             if has_cap
                 selected_entry = entry
@@ -730,7 +737,8 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
                 @goto pop_task
             end
 
-            if can_use_proc(task, entry.gproc, entry.proc, opts, scope)
+            can_use, scope = can_use_proc(task, entry.gproc, entry.proc, opts, scope)
+            if can_use
                 has_cap, est_time_util, est_alloc_util = has_capacity(state, entry.proc, entry.gproc.pid, opts.time_util, opts.alloc_util, sig)
                 if has_cap
                     # Select this processor
