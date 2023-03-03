@@ -197,3 +197,106 @@ constrain(x::ProcessScope, y::ExactScope) =
     x == y.parent ? y : InvalidScope(x, y)
 constrain(x::NodeScope, y::ExactScope) =
     x == y.parent.parent ? y : InvalidScope(x, y)
+
+### Scopes helper
+
+function scope(scs...)
+    if length(scs) == 0
+        return AnyScope()
+    elseif length(scs) == 1
+        if only(scs) == :default
+            return DefaultScope()
+        else
+            return to_scope(only(scs))
+        end
+    end
+    return UnionScope(map(to_scope, scs))
+end
+function scope(; kwargs...)
+    if length(kwargs) == 0
+        return AnyScope()
+    end
+    return to_scope((;kwargs...))
+end
+to_scope(scope::AbstractScope) = scope
+function to_scope(sc::NamedTuple)
+    # FIXME: node and nodes
+    known_keys = (:worker, :workers, :thread, :threads)
+    unknown_keys = filter(key->!in(key, known_keys), keys(sc))
+    if length(unknown_keys) > 0
+        # Hand off construction if unknown members encountered
+        precs = map(scope_key_precedence, map(Val, unknown_keys))
+        max_prec = maximum(precs)
+        if length(findall(prec->prec==max_prec, precs)) > 1
+            throw(ArgumentError("Incompatible scope specifiers detected: $unknown_keys"))
+        end
+        max_prec_key = unknown_keys[argmax(precs)]
+        return to_scope(Val(max_prec_key), sc)
+    end
+
+    workers = if haskey(sc, :worker)
+        Int[sc.worker]
+    elseif haskey(sc, :workers)
+        Int[sc.workers...]
+    else
+        nothing
+    end
+    threads = if haskey(sc, :thread)
+        Int[sc.thread]
+    elseif haskey(sc, :threads)
+        Int[sc.threads...]
+    else
+        nothing
+    end
+
+    # Simple cases
+    if workers === nothing && threads === nothing
+        return AnyScope()
+    elseif workers !== nothing && threads !== nothing
+        subscopes = AbstractScope[]
+        for w in workers, t in threads
+            push!(subscopes, ExactScope(ThreadProc(w, t)))
+        end
+        if length(subscopes) == 1
+            return first(subscopes)
+        end
+        return UnionScope(subscopes)
+    elseif workers !== nothing && threads === nothing
+        subscopes = AbstractScope[ProcessScope(w) for w in workers]
+        if length(subscopes) == 1
+            return first(subscopes)
+        end
+        return UnionScope(subscopes)
+    end
+
+    # More complex cases that require querying the cluster
+    # FIXME: Use per-field scope taint
+    if workers === nothing
+        workers = procs()
+    end
+    subscopes = AbstractScope[]
+    for w in workers
+        if threads === nothing
+            threads = map(c->c.tid,
+                          filter(c->c isa ThreadProc,
+                                 collect(children(OSProc(w)))))
+        end
+        for t in threads
+            push!(subscopes, ExactScope(ThreadProc(w, t)))
+        end
+    end
+    if length(subscopes) == 1
+        return first(subscopes)
+    end
+    return UnionScope(subscopes)
+end
+to_scope(scs::Tuple) =
+    UnionScope(map(to_scope, scs))
+to_scope(sc) =
+    throw(ArgumentError("Cannot construct scope from: $sc"))
+
+to_scope(::Val{key}, sc::NamedTuple) where key =
+    throw(ArgumentError("Scope construction not implemented for key: $key"))
+
+# Base case for all Dagger-owned keys
+scope_key_precedence(::Val) = 0
